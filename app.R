@@ -1,0 +1,285 @@
+library(leaflet)
+library(rgdal)
+library(shiny)
+library(sp)
+library(shinydashboard)
+library(dplyr)
+library(plotly)
+
+
+##################### Data Prep ######################
+
+# Loading Main Data
+crime_data <- readRDS("CrimeData.rds")
+crime_data <- crime_data[complete.cases(crime_data), ]
+crime_data$Year <- as.character(crime_data$Year)
+
+# Loading Shape Data
+chicShapeData = readOGR(dsn="GeoData",layer="ChicBeat")
+chicShapeData$beat_num <- as.integer(chicShapeData$beat_num)
+
+# Map Choropleth
+map_cloro <- crime_data %>% group_by(Beat) %>% summarise(Count = n()) %>% arrange(desc(Count))
+
+# Choropleth Pallet
+pal <- colorBin("YlOrRd", domain =  map_cloro$Count, bins = 8, pretty = TRUE)
+chicShapeData <- merge(chicShapeData,map_cloro,by.x = "beat_num",by.y="Beat", all.x = FALSE)
+chicShapeData$color <- pal(chicShapeData$Count)
+
+# Crime Score
+crime_score <- crime_data %>% group_by(Beat) %>% summarise(Count = n()) %>% arrange(desc(Count))
+
+# Ordered Bar Chart
+ordered_bar_chart <- crime_data %>% group_by(Primary.Type) %>% summarise(Count = n()) %>% arrange(desc(Count)) %>% top_n(10) %>% 
+                     mutate(Primary.Type = factor(Primary.Type, levels = unique(Primary.Type)))
+
+# Time Series crime_data
+time_series <- crime_data %>% group_by(Beat, Year) %>% summarise(Count = n())
+as.character(time_series$Year)
+
+# Bar Chart Comparing Beats
+beat_bar_chart <- crime_data %>% group_by(Beat, Primary.Type) %>% count(Primary.Type)
+
+# Pie Chart
+pie_chart <- crime_data %>% filter(Year == "2019") %>% group_by(Primary.Type, Beat) %>% count(Primary.Type)
+
+##################### UI Start ######################
+ui <- shinyUI(
+      dashboardPage(skin = "yellow",
+        dashboardHeader(title = "CrimeWatch"),
+        
+        # Dashboard Sidebar
+        dashboardSidebar(
+          sidebarMenu(
+            menuItem("Crime Map", tabName = "Map", icon = icon("map-marked-alt")),
+            menuItem("Compare Crimes between Areas", tabName = "CompareBarChart", icon = icon("chart-bar")),
+            menuItem("Compare Areas over Time", tabName = "CompareLineChart", icon = icon("chart-line"))
+          )),
+        
+        # Dashboard Body
+        dashboardBody(
+          tabItems(
+            
+            # Crime Map Page
+            tabItem(tabName = "Map",
+            
+                    fluidRow(
+                      column(width = 7,
+                             box(
+                              title = "Crime Map", width = NULL, solidHeader = TRUE, background = "yellow",
+                               leafletOutput("chicmap", height = "86vh")
+                             )),
+                      
+                      column(width = 5,
+                             box(
+                              width = NULL, solidHeader = FALSE, background = "maroon",
+                               valueBoxOutput("crimeScoreBox", width = 5)
+                             ),                             
+                             box(
+                               title = "Crime Breakdown of Area", width = NULL, solidHeader = TRUE, background = "teal",
+                               plotlyOutput("pieChart", height = "32vh")
+                             ),
+                             box(
+                               title = "Crime Progression over Time", width = NULL, background = "teal",
+                               plotlyOutput("timeSeriesBeat", height = "32vh")
+                             ))
+                    )),
+            
+            # Compare Crimes betwwen Beats Page
+            tabItem(tabName = "CompareBarChart",
+                    fluidRow(
+                      box(
+                        width = 4, height = "10vh", solidHeader = TRUE,
+                        selectizeInput("crimeSelectBar", "Select Areas:", choices = beat_bar_chart$Beat, multiple = TRUE)                      
+                      )),
+                    
+                    fluidRow(
+                      box(
+                        title = "Compare Crimes between Areas", solidHeader = TRUE, width = 12 ,
+                        plotlyOutput("beatBarChart", height = "75vh")
+                      ))
+                    ),
+              
+            # Compare Beats over Time Page
+            tabItem(tabName = "CompareLineChart",
+                    fluidRow(
+                      box(
+                        width = 4, height = "10vh", solidHeader = TRUE,
+                        sliderInput("yearSliderLine", "Set Year Range:", round = TRUE, min = 2013, max = 2019, value = c(2013,2019))
+                      )),
+
+                    fluidRow(
+                      box(
+                        title = "Comaprare Areas over Time", solidHeader = TRUE, width = 12,
+                        plotlyOutput("timeSeries", height = "75vh")
+                      ))
+                    )
+            ))
+        ))
+
+##################### UI End ######################
+
+##################### Server Start ######################
+server <- function(input, output, session){
+
+##################### Crime Map ######################  
+output$chicmap <- renderLeaflet({
+    # Create Base Map
+    chicmap <- leaflet() %>% addTiles() 
+    
+    # Adding polygon
+    chicmap %>% addPolygons(data=chicShapeData,
+                            label = ~beat_num,
+                            layerId = ~beat_num,
+                            fillColor = ~color,
+                            weight = 2,
+                            opacity = 1,
+                            color = "white",
+                            dashArray = "3",
+                            fillOpacity = 0.7,
+                            highlight = highlightOptions(weight = 3,
+                                                         color = "red",
+                                                         fillOpacity = 0,
+                                                         bringToFront = TRUE)) %>%
+                            addLegend(position = "bottomleft",
+                                      pal = pal,
+                                      #values = ~Count,
+                                      values = map_cloro$Count,
+                                      opacity = 0.7,
+                                      title = "Legend") %>%
+      setView(lng= -87.6985, lat = 41.8399,zoom = 11)
+  })
+
+# Add Markers
+observe({
+  click = input$chicmap_shape_click
+
+  # Subset Crime Data Based On Beat Clicked
+  sub = crime_data[crime_data$Beat==input$chicmap_shape_click$id, c("Longitude","Latitude","Beat","Primary.Type")]
+  if(is.null(click))
+    return()
+  else
+    leafletProxy("chicmap") %>%
+    clearMarkerClusters() %>%
+    addMarkers(data = sub,
+               lng = ~Longitude,
+               lat = ~Latitude,
+               popup = ~Primary.Type,
+               clusterOptions = markerClusterOptions())
+})
+
+##################### Click Events ######################  
+# Zoom Level
+observe({  
+  click = input$chicmap_shape_click
+  if(is.null(click))
+    return()
+  else
+    leafletProxy("chicmap") %>%
+    setView(lng = click$lng , lat = click$lat, zoom = 14)
+  })
+
+#Add Markers
+observe({
+  click = input$chicmap_shape_click
+  if(is.null(click))
+    return()
+  else
+    sub = crime_data[crime_data$Beat==input$chicmap_shape_click$id, c("Longitude","Latitude","Beat","Primary.Type")]
+    leafletProxy("chicmap") %>%
+    clearMarkerClusters() %>%
+    addMarkers(data = sub,
+               lng = ~Longitude,
+               lat = ~Latitude,
+               popup = ~Primary.Type,
+               clusterOptions = markerClusterOptions())
+  })
+
+# Pie Chart For Beat
+observe({
+  click = input$chicmap_shape_click
+
+  if(is.null(click))
+    return()
+  else
+    sub = pie_chart[pie_chart$Beat==input$chicmap_shape_click$id, c("Beat", "Primary.Type", "n")]
+    output$pieChart <- renderPlotly({
+      plot_ly(sub,
+              labels = ~Primary.Type,
+              values = ~n,
+              type = 'pie') %>%
+        layout(xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+               yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE)
+               )
+    })
+})
+
+# Line Chart for Beat
+observe({
+  click = input$chicmap_shape_click
+
+  if(is.null(click))
+    return()
+  else
+    sub = time_series[time_series$Beat==input$chicmap_shape_click$id, c("Beat", "Year", "Count")]
+    output$timeSeriesBeat <- renderPlotly({
+      plot_ly(sub,
+              x = ~Year,
+              y = ~Count,
+              type = 'scatter',
+              mode = 'lines+markers') %>%
+        add_lines(color = ~ordered(Beat)) %>%
+        layout(showlegend = FALSE)
+    })
+})
+
+# Crime Score For Beat
+observe({
+  click = input$chicmap_shape_click
+  if(is.null(click))
+    return()
+  else
+    sub = map_cloro[map_cloro$Beat==input$chicmap_shape_click$id, c("Beat", "Count")]
+    output$crimeScoreBox <- renderValueBox({
+      valueBox(
+        paste0(signif((sub$Count/sum(crime_score$Count)*10000), digits = 5), "%"), "Crime Score", icon = icon("balance-scale"), color = "maroon")
+    })
+})
+
+##################### Time Sries/Line Chart ###################### VERSION 2 REQUIRES REACTIVE ELEMENT 
+output$timeSeries <- renderPlotly({
+  if (length(input$yearSliderLine) != 0) {
+    year_data <- subset(time_series,Year >= input$yearSliderLine[1] & Year <= input$yearSliderLine[2],)
+    
+  } else {
+    year_data <- time_series
+  }
+  plot_ly(year_data,
+          x = ~Year,
+          y = ~Count,
+          type = 'scatter',
+          mode = 'lines+markers',
+          visible='legendonly') %>%
+    add_lines(color = ~ordered(Beat))
+})
+
+##################### Beat Bar Chart ######################
+output$beatBarChart <- renderPlotly({
+  if (length(input$crimeSelectBar) != 0) {
+    beat_data <- subset(beat_bar_chart,Beat %in% input$crimeSelectBar)
+  } else {
+    beat_data <- beat_bar_chart
+  }
+  beat_data$Beat <- as.character(beat_data$Beat)
+  plot_ly(beat_data,
+          x = ~Beat,
+          y = ~n,
+          color = ~Primary.Type,
+          type= 'bar',
+          visible='legendonly') %>%
+    layout(yaxis = list(title = 'Count', barmode = 'group'))
+  })
+}
+##################### Server End ######################
+
+shinyApp(ui, server)
